@@ -1,0 +1,24 @@
+{
+  "name": "afterframe-videojs-skin",
+  "private": true,
+  "version": "1.0.0",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "desktop:dev": "node scripts/desktop-dev.mjs",
+    "desktop": "npm run build && node scripts/launch-electron.mjs"
+  },
+  "dependencies": {
+    "@videojs/react": "^10.3.0",
+    "@vitejs/plugin-react": "latest",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "electron": "^45.3.1"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "AFTERFRAME Player",
+  "short_name": "AFTERFRAME",
+  "description": "A local-first cinematic video player.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#070808",
+  "theme_color": "#070808",
+  "icons": [
+    {
+      "src": "./afterframe.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
