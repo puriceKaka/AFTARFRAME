@@ -426,8 +426,11 @@ function AppChrome(props) {
 
   const reveal = React.useCallback(() => {
     setControlsVisible(true); clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => { if (!paused) setControlsVisible(false); }, 2600);
-  }, [paused]);
+    timerRef.current = setTimeout(() => {
+      const focusIsInPlayer = playerShellRef.current?.contains(document.activeElement);
+      if (!paused && !props.openPanel && !subtitleMenuOpen && !focusIsInPlayer) setControlsVisible(false);
+    }, 2600);
+  }, [paused, props.openPanel, subtitleMenuOpen]);
   React.useEffect(() => { if (paused) { clearTimeout(timerRef.current); setControlsVisible(true); } else reveal(); }, [paused, reveal]);
   React.useEffect(() => () => clearTimeout(timerRef.current), []);
   React.useEffect(() => () => clearTimeout(feedbackTimerRef.current), []);
@@ -509,6 +512,20 @@ function AppChrome(props) {
     return () => window.removeEventListener('keydown', onKey);
   }, [paused, play, pause, currentTime, duration, seek, muted, setMuted, fullscreen, exitFullscreen, requestFullscreen, rates, playbackRate, setPlaybackRate, props, reveal]);
 
+  React.useEffect(() => {
+    const closeMenus = (event) => {
+      if (event.key !== 'Escape') return;
+      if (!props.openPanel && !subtitleMenuOpen) return;
+      if (event.target instanceof HTMLElement && event.target.closest('.language-picker')) return;
+      event.stopPropagation();
+      setSubtitleMenuOpen(false);
+      props.onClose();
+      reveal();
+    };
+    window.addEventListener('keydown', closeMenus, true);
+    return () => window.removeEventListener('keydown', closeMenus, true);
+  }, [props.openPanel, props.onClose, subtitleMenuOpen, reveal]);
+
   const activePanel = props.openPanel;
   const seekBy = (delta, direction = delta < 0 ? 'left' : 'right') => {
     seek(Math.max(0, Math.min(duration || currentTime + delta, currentTime + delta)))?.catch?.(() => {});
@@ -560,7 +577,7 @@ function AppChrome(props) {
     </header>
 
     {!props.hasVideo && <div className="empty-player" onClick={props.onOpen} role="button" tabIndex="0" onKeyDown={(event) => { if (event.key === 'Enter') props.onOpen(); }}><div className="empty-play"><Icon name="play" size={27}/></div><strong>Drop in and play</strong><span>Open a video or drag one onto this window</span></div>}
-    {props.hasVideo && paused && <button className="center-play" type="button" onClick={togglePlay} aria-label="Play video"><Icon name="play" size={49}/></button>}
+    {props.hasVideo && paused && <button className="center-play" type="button" onClick={togglePlay} aria-label="Play video"><Icon name="logo" size={44}/></button>}
     {props.hasVideo && seekFeedback && <div className={`seek-feedback feedback-${seekFeedback.direction}`} aria-live="polite"><Icon name={seekFeedback.direction === 'left' ? 'rewind10' : 'forward10'} size={24}/><span>10 seconds</span></div>}
 
     {activePanel === 'library' && <LibraryPanel items={props.history} activeId={props.activeId} onOpen={props.onOpenLibraryItem} onRemove={props.onRemoveHistory} onToggleSaved={props.onToggleSaved} onClose={props.onClose}/>}
@@ -574,7 +591,7 @@ function AppChrome(props) {
       </div>
       <div className="bottom-controls" role="group" aria-label="Video controls">
         <div className="controls-left">
-          <button className="control-button" type="button" onClick={togglePlay} aria-label={paused ? 'Play' : 'Pause'} title={paused ? 'Play (Space)' : 'Pause (Space)'}><Icon name={paused ? 'play' : 'pause'} size={20}/></button>
+          <button className="control-button primary-transport" type="button" onClick={togglePlay} aria-label={paused ? 'Play' : 'Pause'} title={paused ? 'Play (Space)' : 'Pause (Space)'}><Icon name={paused ? 'play' : 'pause'} size={19}/></button>
           <button className="control-button skip-button" type="button" onClick={() => seekBy(-10)} aria-label="Back 10 seconds" title="Back 10 seconds"><Icon name="rewind10" size={21}/></button>
           <button className="control-button skip-button" type="button" onClick={() => seekBy(10)} aria-label="Forward 10 seconds" title="Forward 10 seconds"><Icon name="forward10" size={21}/></button>
           <button className="control-button" type="button" onClick={() => props.onPrevious()} aria-label="Previous video" title="Previous video"><Icon name="prev" size={17}/></button>
@@ -627,8 +644,8 @@ function SubtitleLanguageSelect({ value, onChange, triggerLabel }) {
   return <div className="subtitle-language-picker">
     {!triggerLabel && <label htmlFor={inputId}>Subtitle language</label>}
     <div className="language-picker">
-      {triggerLabel ? <button className="subtitle-add-button" type="button" role="combobox" aria-expanded={open} aria-controls={inputId} onClick={() => { setQuery(''); setOpen((current) => !current); }}>{triggerLabel}</button> : <input id={inputId} className="subtitle-language-input" type="search" role="combobox" aria-expanded={open} aria-controls={inputId} aria-autocomplete="list" value={open ? query : selected.name} placeholder="Search languages…" onFocus={() => { setQuery(''); setOpen(true); }} onChange={(event) => { setQuery(event.target.value); setOpen(true); }} onKeyDown={(event) => { if (event.key === 'Escape') setOpen(false); if (event.key === 'Enter' && options[0]) { event.preventDefault(); onChange(options[0].code); setOpen(false); setQuery(''); } }}/>}
-      {open && <><input className="language-dropdown-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search languages…" aria-label="Search subtitle languages" autoFocus/><ul className="language-options" id={inputId} role="listbox" aria-label="Subtitle languages">{options.map((language) => <li key={language.code}><button type="button" role="option" aria-selected={language.code === value} onClick={() => { onChange(language.code); setOpen(false); setQuery(''); }}>{language.name}<small>{language.code.toUpperCase()}</small></button></li>)}{!options.length && <li className="language-no-results">No matching language</li>}</ul></>}
+      {triggerLabel ? <button className="subtitle-add-button" type="button" role="combobox" aria-expanded={open} aria-controls={inputId} onClick={() => { setQuery(''); setOpen((current) => !current); }} onKeyDown={(event) => { if (event.key === 'Escape') setOpen(false); }}>{triggerLabel}</button> : <input id={inputId} className="subtitle-language-input" type="search" role="combobox" aria-expanded={open} aria-controls={inputId} aria-autocomplete="list" value={open ? query : selected.name} placeholder="Search languages…" onFocus={() => { setQuery(''); setOpen(true); }} onChange={(event) => { setQuery(event.target.value); setOpen(true); }} onKeyDown={(event) => { if (event.key === 'Escape') setOpen(false); if (event.key === 'Enter' && options[0]) { event.preventDefault(); onChange(options[0].code); setOpen(false); setQuery(''); } }}/>}
+      {open && <><input className="language-dropdown-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); setOpen(false); } if (event.key === 'Enter' && options[0]) { event.preventDefault(); onChange(options[0].code); setOpen(false); setQuery(''); } }} placeholder="Search languages…" aria-label="Search subtitle languages" autoFocus/><ul className="language-options" id={inputId} role="listbox" aria-label="Subtitle languages">{options.map((language) => <li key={language.code}><button type="button" role="option" aria-selected={language.code === value} onClick={() => { onChange(language.code); setOpen(false); setQuery(''); }}>{language.name}<small>{language.code.toUpperCase()}</small></button></li>)}{!options.length && <li className="language-no-results">No matching language</li>}</ul></>}
     </div>
   </div>;
 }
