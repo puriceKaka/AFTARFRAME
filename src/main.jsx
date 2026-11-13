@@ -2,6 +2,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { Container } from '@videojs/react';
 import { Video, VideoPlayer, usePlayer } from '@videojs/react/video';
+import { isSupabaseConfigured, supabase } from './lib/supabaseClient.js';
 import './styles.css';
 
 const HISTORY_KEY = 'afterframe-library-v2';
@@ -96,6 +97,19 @@ async function forgetLocalFile(key) {
 }
 function stableId(file) { return `${file.name}|${file.size}|${file.lastModified}`; }
 
+async function cloudVideoKey(item) {
+  // Never send file paths. Hash only file metadata so the same local item can
+  // be matched across sessions without exposing its filesystem location.
+  const source = `${item.name || ''}|${item.size || 0}|${item.lastModified || 0}`;
+  if (globalThis.crypto?.subtle) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+  let hash = 2166136261;
+  for (const character of source) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  return `fnv-${(hash >>> 0).toString(16)}`;
+}
+
 function App() {
   const [history, setHistory] = React.useState(readHistory);
   const [settings, setSettings] = React.useState(readSettings);
@@ -110,14 +124,113 @@ function App() {
   const [dragging, setDragging] = React.useState(false);
   const [notice, setNotice] = React.useState('');
   const [playRequest, setPlayRequest] = React.useState(0);
+  const [cloudUser, setCloudUser] = React.useState(null);
+  const [cloudStatus, setCloudStatus] = React.useState(isSupabaseConfigured ? 'Sign in to sync playback progress.' : 'Add your Supabase Vite environment variables to enable cloud sync.');
+  const [cloudBusy, setCloudBusy] = React.useState(false);
   const inputRef = React.useRef(null);
   const subtitleInputRef = React.useRef(null);
   const subtitleUrlRef = React.useRef('');
   const objectUrlRef = React.useRef('');
   const playlistRef = React.useRef([]);
+  const cloudSyncBusyRef = React.useRef(false);
 
   React.useEffect(() => () => { if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current); if (subtitleUrlRef.current) URL.revokeObjectURL(subtitleUrlRef.current); }, []);
   const notify = React.useCallback((message) => { setNotice(message); window.clearTimeout(notify.timer); notify.timer = window.setTimeout(() => setNotice(''), 3500); }, []);
+
+  React.useEffect(() => {
+    if (!supabase) return;
+    let active = true;
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!active) return;
+      if (error) setCloudStatus('Could not restore your Supabase session.');
+      setCloudUser(data?.session?.user || null);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setCloudUser(session?.user || null);
+      setCloudStatus(session?.user ? 'Signed in. Syncing your library…' : 'Sign in to sync playback progress.');
+    });
+    return () => { active = false; subscription.unsubscribe(); };
+  }, []);
+
+  const syncCloudHistory = React.useCallback(async (items, mergeRemote = false) => {
+    if (!supabase || !cloudUser || cloudSyncBusyRef.current) return;
+    cloudSyncBusyRef.current = true;
+    setCloudBusy(true);
+    setCloudStatus(mergeRemote ? 'Loading your saved progress…' : 'Syncing playback progress…');
+    try {
+      const eligible = (items || readHistory()).filter((item) => item.name && !item.path && (item.size || item.lastModified));
+      const keyed = await Promise.all(eligible.map(async (item) => ({ item, video_key: await cloudVideoKey(item) })));
+      let merged = keyed;
+      if (mergeRemote) {
+        const { data: remoteRows, error } = await supabase.from('video_progress').select('video_key,title,position_seconds,duration_seconds,is_saved,updated_at');
+        if (error) throw error;
+        const remoteByKey = new Map((remoteRows || []).map((row) => [row.video_key, row]));
+        merged = keyed.map(({ item, video_key }) => {
+          const remote = remoteByKey.get(video_key);
+          if (!remote || Date.parse(remote.updated_at) <= Number(item.lastPlayed || item.lastOpened || 0)) return { item, video_key };
+          const timestamp = Date.parse(remote.updated_at) || Date.now();
+          return { video_key, item: { ...item, position: remote.position_seconds, duration: remote.duration_seconds, saved: remote.is_saved, lastPlayed: timestamp } };
+        });
+        const mergedById = new Map(merged.map(({ item }) => [item.id, item]));
+        const next = readHistory().map((item) => mergedById.get(item.id) || item);
+        writeHistory(next);
+        setHistory(next);
+      }
+      const payload = merged.map(({ item, video_key }) => ({
+        user_id: cloudUser.id,
+        video_key,
+        title: item.name,
+        position_seconds: Math.max(0, Number(item.position) || 0),
+        duration_seconds: Math.max(0, Number(item.duration) || 0),
+        is_saved: Boolean(item.saved),
+        updated_at: new Date(Number(item.lastPlayed || item.lastOpened) || Date.now()).toISOString(),
+      }));
+      if (payload.length) {
+        const { error } = await supabase.from('video_progress').upsert(payload, { onConflict: 'user_id,video_key' });
+        if (error) throw error;
+      }
+      setCloudStatus(`Synced ${payload.length} ${payload.length === 1 ? 'video' : 'videos'} · ${cloudUser.email || 'account'}`);
+    } catch (error) {
+      console.error('Supabase playback sync failed:', error);
+      setCloudStatus('Sync failed. Check the database migration and Supabase connection.');
+    } finally {
+      cloudSyncBusyRef.current = false;
+      setCloudBusy(false);
+    }
+  }, [cloudUser]);
+
+  React.useEffect(() => {
+    if (!cloudUser) return undefined;
+    const timer = window.setTimeout(() => syncCloudHistory(readHistory()), 1800);
+    return () => window.clearTimeout(timer);
+  }, [history, cloudUser, syncCloudHistory]);
+
+  React.useEffect(() => {
+    if (cloudUser) syncCloudHistory(readHistory(), true);
+  // A sign-in performs the one-time cloud/local merge for this account.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cloudUser?.id]);
+
+  const submitCloudAuth = async (email, password, createAccount) => {
+    if (!supabase) return;
+    setCloudBusy(true);
+    setCloudStatus(createAccount ? 'Creating your account…' : 'Signing in…');
+    try {
+      const result = createAccount
+        ? await supabase.auth.signUp({ email, password })
+        : await supabase.auth.signInWithPassword({ email, password });
+      if (result.error) throw result.error;
+      if (createAccount && !result.data.session) setCloudStatus('Check your email to confirm the account, then sign in.');
+      else setCloudStatus('Signed in. Syncing your library…');
+    } catch (error) {
+      setCloudStatus(error?.message || 'Could not connect to Supabase.');
+    } finally { setCloudBusy(false); }
+  };
+  const signOutCloud = async () => {
+    if (!supabase) return;
+    const { error } = await supabase.auth.signOut();
+    setCloudStatus(error ? 'Could not sign out.' : 'Signed out. Local playback remains available.');
+  };
 
   React.useEffect(() => {
     if (!window.afterframeDesktop?.isDesktop) return;
@@ -259,7 +372,7 @@ function App() {
     <VideoPlayer>
       <Container className="player-stage">
         <Video src={src || undefined} playsInline preload="metadata" aria-label={title || 'AFTERFRAME video player'}>{externalSubtitle && <track key={`${externalSubtitle.src}-${externalSubtitleLanguage}`} kind="subtitles" src={externalSubtitle.src} srcLang={externalSubtitleLanguage} label={`${externalSubtitle.label} · ${SUBTITLE_LANGUAGES.find((language) => language.code === externalSubtitleLanguage)?.name || externalSubtitleLanguage}`} />}</Video>
-        <AppChrome title={title} src={src} hasVideo={Boolean(src)} playRequest={playRequest} onOpen={openPicker} onPanel={setOpenPanel} openPanel={openPanel} history={history} onOpenLibraryItem={openLibraryItem} onRemoveHistory={removeHistoryItem} onToggleSaved={toggleSaved} settings={settings} onSettings={persistSettings} onClose={() => setOpenPanel('')} onProgress={handleProgress} activeId={playlist[activeIndex]?.id} onPrevious={() => activatePlaylistIndex(activeIndex - 1)} onNext={() => activatePlaylistIndex(activeIndex + 1)} playlist={playlist} activeIndex={activeIndex} resumeAt={resumeAt} onResumeApplied={() => setResumeAt(0)} notify={notify} externalSubtitle={externalSubtitle} externalSubtitleLanguage={externalSubtitleLanguage} onSubtitleLanguageChange={setExternalSubtitleLanguage} onLoadSubtitle={() => subtitleInputRef.current?.click()} />
+        <AppChrome title={title} src={src} hasVideo={Boolean(src)} playRequest={playRequest} onOpen={openPicker} onPanel={setOpenPanel} openPanel={openPanel} history={history} onOpenLibraryItem={openLibraryItem} onRemoveHistory={removeHistoryItem} onToggleSaved={toggleSaved} settings={settings} onSettings={persistSettings} onClose={() => setOpenPanel('')} onProgress={handleProgress} activeId={playlist[activeIndex]?.id} onPrevious={() => activatePlaylistIndex(activeIndex - 1)} onNext={() => activatePlaylistIndex(activeIndex + 1)} playlist={playlist} activeIndex={activeIndex} resumeAt={resumeAt} onResumeApplied={() => setResumeAt(0)} notify={notify} externalSubtitle={externalSubtitle} externalSubtitleLanguage={externalSubtitleLanguage} onSubtitleLanguageChange={setExternalSubtitleLanguage} onLoadSubtitle={() => subtitleInputRef.current?.click()} cloudUser={cloudUser} cloudStatus={cloudStatus} cloudBusy={cloudBusy} onCloudAuth={submitCloudAuth} onCloudSignOut={signOutCloud} onCloudSync={() => syncCloudHistory(readHistory(), true)} />
       </Container>
     </VideoPlayer>
     <input ref={inputRef} className="file-input" type="file" accept={`video/*,${FORMATS}`} multiple onChange={onReopenFiles} aria-label="Choose video files" />
@@ -451,7 +564,7 @@ function AppChrome(props) {
     {props.hasVideo && seekFeedback && <div className={`seek-feedback feedback-${seekFeedback.direction}`} aria-live="polite"><Icon name={seekFeedback.direction === 'left' ? 'rewind10' : 'forward10'} size={24}/><span>10 seconds</span></div>}
 
     {activePanel === 'library' && <LibraryPanel items={props.history} activeId={props.activeId} onOpen={props.onOpenLibraryItem} onRemove={props.onRemoveHistory} onToggleSaved={props.onToggleSaved} onClose={props.onClose}/>}
-    {activePanel === 'settings' && <SettingsPanel settings={props.settings} onChange={props.onSettings} rates={rates} playbackRate={playbackRate} setPlaybackRate={setPlaybackRate} tracks={textTrackList} subtitlesShowing={subtitlesShowing} selectSubtitlesTrack={selectSubtitlesTrack} externalSubtitle={props.externalSubtitle} externalSubtitleLanguage={props.externalSubtitleLanguage} onSubtitleLanguageChange={props.onSubtitleLanguageChange} onLoadSubtitle={props.onLoadSubtitle} audioTracks={audioTrackList} selectAudioTrack={selectAudioTrack} onClose={props.onClose}/>}
+    {activePanel === 'settings' && <SettingsPanel settings={props.settings} onChange={props.onSettings} rates={rates} playbackRate={playbackRate} setPlaybackRate={setPlaybackRate} tracks={textTrackList} subtitlesShowing={subtitlesShowing} selectSubtitlesTrack={selectSubtitlesTrack} externalSubtitle={props.externalSubtitle} externalSubtitleLanguage={props.externalSubtitleLanguage} onSubtitleLanguageChange={props.onSubtitleLanguageChange} onLoadSubtitle={props.onLoadSubtitle} audioTracks={audioTrackList} selectAudioTrack={selectAudioTrack} onClose={props.onClose} cloudUser={props.cloudUser} cloudStatus={props.cloudStatus} cloudBusy={props.cloudBusy} onCloudAuth={props.onCloudAuth} onCloudSignOut={props.onCloudSignOut} onCloudSync={props.onCloudSync}/>}
 
     {props.hasVideo && <>
       <div className="timeline-controls">
@@ -532,7 +645,7 @@ function SubtitleControls({ tracks, subtitlesShowing, selectSubtitlesTrack, exte
   </section>;
 }
 
-function SettingsPanel({ settings, onChange, rates, playbackRate, setPlaybackRate, tracks, subtitlesShowing, selectSubtitlesTrack, externalSubtitle, externalSubtitleLanguage, onSubtitleLanguageChange, onLoadSubtitle, audioTracks, selectAudioTrack, onClose }) {
+function SettingsPanel({ settings, onChange, rates, playbackRate, setPlaybackRate, tracks, subtitlesShowing, selectSubtitlesTrack, externalSubtitle, externalSubtitleLanguage, onSubtitleLanguageChange, onLoadSubtitle, audioTracks, selectAudioTrack, onClose, cloudUser, cloudStatus, cloudBusy, onCloudAuth, onCloudSignOut, onCloudSync }) {
   return <section className="side-panel settings-panel" aria-label="Player settings">
     <div className="panel-header"><div><span className="eyebrow">PLAYER PREFERENCES</span><h2>Settings</h2></div><button className="panel-close" onClick={onClose} aria-label="Close settings"><Icon name="close"/></button></div>
     <div className="settings-content">
@@ -540,8 +653,29 @@ function SettingsPanel({ settings, onChange, rates, playbackRate, setPlaybackRat
       <SubtitleControls tracks={tracks} subtitlesShowing={subtitlesShowing} selectSubtitlesTrack={selectSubtitlesTrack} externalSubtitle={externalSubtitle} externalSubtitleLanguage={externalSubtitleLanguage} onLanguageChange={onSubtitleLanguageChange} onLoadSubtitle={onLoadSubtitle}/>
       <section className="setting-section"><h3>Audio track</h3>{audioTracks?.length ? audioTracks.map((track) => <button key={track.id} className="setting-row" type="button" onClick={() => selectAudioTrack(track.id)}><span>{track.label || track.language || `Track ${track.id}`}</span><span>{track.enabled ? '✓' : ''}</span></button>) : <p className="setting-hint">Audio track selection is available when a video provides multiple tracks.</p>}</section>
       <section className="setting-section"><h3>Playback preferences</h3><button className="setting-row" type="button" onClick={() => onChange({ ...settings, resume: !settings.resume })}><span>Resume where I stopped</span><span className={`toggle${settings.resume ? ' enabled' : ''}`}/></button><button className="setting-row" type="button" onClick={() => onChange({ ...settings, rememberVolume: !settings.rememberVolume })}><span>Remember volume level</span><span className={`toggle${settings.rememberVolume ? ' enabled' : ''}`}/></button><button className="setting-row" type="button" onClick={() => onChange({ ...settings, defaultSpeed: settings.defaultSpeed === 1 ? 1.25 : 1 })}><span>Default speed</span><span>{settings.defaultSpeed}×</span></button></section>
+      <CloudAccountSection user={cloudUser} status={cloudStatus} busy={cloudBusy} onAuth={onCloudAuth} onSignOut={onCloudSignOut} onSync={onCloudSync}/>
       <section className="setting-section shortcuts"><h3>Keyboard shortcuts</h3><p><kbd>Space</kbd> Play or pause</p><p><kbd>←</kbd> <kbd>→</kbd> Seek 5 seconds · <kbd>Shift</kbd> + arrow seeks 30</p><p><kbd>M</kbd> Mute · <kbd>F</kbd> Fullscreen</p><p><kbd>[</kbd> <kbd>]</kbd> Change speed · <kbd>N</kbd> / <kbd>P</kbd> Next / previous</p></section>
     </div>
+  </section>;
+}
+
+function CloudAccountSection({ user, status, busy, onAuth, onSignOut, onSync }) {
+  const [email, setEmail] = React.useState('');
+  const [password, setPassword] = React.useState('');
+  const [createAccount, setCreateAccount] = React.useState(false);
+  return <section className="setting-section cloud-account-section">
+    <h3>Cloud library</h3>
+    <p className="setting-hint">Syncs titles, saved state and resume positions. Your video and subtitle files stay on this device.</p>
+    {user ? <>
+      <p className="cloud-account-email">Signed in as <strong>{user.email}</strong></p>
+      <div className="cloud-actions"><button type="button" disabled={busy} onClick={onSync}>Sync now</button><button type="button" onClick={onSignOut}>Sign out</button></div>
+    </> : isSupabaseConfigured ? <form className="cloud-auth-form" onSubmit={(event) => { event.preventDefault(); onAuth(email.trim(), password, createAccount); }}>
+      <label>Email<input type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com"/></label>
+      <label>Password<input type="password" autoComplete={createAccount ? 'new-password' : 'current-password'} minLength="6" required value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 6 characters"/></label>
+      <button className="cloud-submit" type="submit" disabled={busy}>{busy ? 'Please wait…' : createAccount ? 'Create account' : 'Sign in'}</button>
+      <button className="cloud-mode-toggle" type="button" onClick={() => setCreateAccount((value) => !value)}>{createAccount ? 'Already have an account? Sign in' : 'New here? Create an account'}</button>
+    </form> : null}
+    <p className="cloud-status" role="status">{status}</p>
   </section>;
 }
 

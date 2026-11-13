@@ -1,4 +1,4 @@
--- Optional cloud metadata for future account-based sync.
+-- Account-based playback metadata sync.
 -- This table stores no video files, local paths, or subtitle contents.
 create table if not exists public.video_progress (
   user_id uuid not null references auth.users (id) on delete cascade,
