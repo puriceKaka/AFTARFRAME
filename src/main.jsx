@@ -440,9 +440,9 @@ function AppChrome(props) {
     <header className="app-toolbar" aria-label="AFTERFRAME toolbar">
       <div className="app-brand" aria-label="AFTERFRAME"><span className="brand-mark"><Icon name="logo" size={27}/></span><span>AFTERFRAME</span></div>
       <nav className="primary-actions" aria-label="Library and app actions">
-        <button className="toolbar-button primary-open" type="button" onClick={props.onOpen}><Icon name="open"/><span>Open video</span></button>
-        <button className={`toolbar-button${activePanel === 'library' ? ' selected' : ''}`} type="button" onClick={() => props.onPanel(activePanel === 'library' ? '' : 'library')} aria-expanded={activePanel === 'library'}><Icon name="library"/><span>Video library</span></button>
-        <button className={`toolbar-button${activePanel === 'settings' ? ' selected' : ''}`} type="button" onClick={() => props.onPanel(activePanel === 'settings' ? '' : 'settings')} aria-expanded={activePanel === 'settings'}><Icon name="settings"/><span>Settings</span></button>
+        <button className="toolbar-button primary-open" type="button" onClick={props.onOpen} aria-label="Open video"><Icon name="open"/><span>Open video</span></button>
+        <button className={`toolbar-button${activePanel === 'library' ? ' selected' : ''}`} type="button" onClick={() => props.onPanel(activePanel === 'library' ? '' : 'library')} aria-expanded={activePanel === 'library'} aria-label="Video library"><Icon name="library"/><span>Video library</span></button>
+        <button className={`toolbar-button${activePanel === 'settings' ? ' selected' : ''}`} type="button" onClick={() => props.onPanel(activePanel === 'settings' ? '' : 'settings')} aria-expanded={activePanel === 'settings'} aria-label="Settings"><Icon name="settings"/><span>Settings</span></button>
       </nav>
     </header>
 

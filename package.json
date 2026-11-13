@@ -12,6 +12,7 @@
     "desktop": "npm run build && node scripts/launch-electron.mjs"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.119.0",
     "@videojs/react": "^10.3.0",
     "@vitejs/plugin-react": "latest",
     "react": "^19.0.0",
