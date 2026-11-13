@@ -576,7 +576,7 @@ function AppChrome(props) {
       </nav>
     </header>
 
-    {!props.hasVideo && <div className="empty-player" onClick={props.onOpen} role="button" tabIndex="0" onKeyDown={(event) => { if (event.key === 'Enter') props.onOpen(); }}><div className="empty-play"><Icon name="play" size={27}/></div><strong>Drop in and play</strong><span>Open a video or drag one onto this window</span></div>}
+    {!props.hasVideo && <div className="empty-player" onClick={props.onOpen} role="button" tabIndex="0" onKeyDown={(event) => { if (event.key === 'Enter') props.onOpen(); }}><div className="empty-play"><Icon name="logo" size={38}/></div><strong>Drop in and play</strong><span>Open a video or drag one onto this window</span></div>}
     {props.hasVideo && paused && <button className="center-play" type="button" onClick={togglePlay} aria-label="Play video"><Icon name="logo" size={44}/></button>}
     {props.hasVideo && seekFeedback && <div className={`seek-feedback feedback-${seekFeedback.direction}`} aria-live="polite"><Icon name={seekFeedback.direction === 'left' ? 'rewind10' : 'forward10'} size={24}/><span>10 seconds</span></div>}
 
