@@ -6,6 +6,7 @@ import { isSupabaseConfigured, supabase } from './lib/supabaseClient.js';
 import './styles.css';
 
 const HISTORY_KEY = 'afterframe-library-v2';
+const ACTIVE_VIDEO_KEY = 'afterframe-active-video-v1';
 const SETTINGS_KEY = 'afterframe-settings-v1';
 const DB_NAME = 'afterframe-local-library';
 const DB_STORE = 'video-handles';
@@ -169,6 +170,9 @@ function App() {
           const remote = remoteByKey.get(video_key);
           if (!remote || Date.parse(remote.updated_at) <= Number(item.lastPlayed || item.lastOpened || 0)) return { item, video_key };
           const timestamp = Date.parse(remote.updated_at) || Date.now();
+          if (localStorage.getItem(ACTIVE_VIDEO_KEY) === item.id && playlistRef.current.some((entry) => entry.id === item.id)) {
+            setResumeAt(Math.max(0, Number(remote.position_seconds) || 0));
+          }
           return { video_key, item: { ...item, position: remote.position_seconds, duration: remote.duration_seconds, saved: remote.is_saved, lastPlayed: timestamp } };
         });
         const mergedById = new Map(merged.map(({ item }) => [item.id, item]));
@@ -232,24 +236,17 @@ function App() {
     setCloudStatus(error ? 'Could not sign out.' : 'Signed out. Local playback remains available.');
   };
 
-  React.useEffect(() => {
-    if (!window.afterframeDesktop?.isDesktop) return;
-    window.afterframeDesktop.getLibrary().then((items) => {
-      const existing = readHistory();
-      const storedByPath = new Map(existing.filter((item) => item.path).map((item) => [item.path, item]));
-      const restored = items.map((item) => ({ ...item, id: `desktop:${item.path}`, ...(storedByPath.get(item.path) || {}), path: item.path }));
-      const next = [...restored, ...existing.filter((item) => !item.path)];
-      writeHistory(next); setHistory(next);
-    }).catch(() => {});
-  }, []);
-
   const persistSettings = (next) => { setSettings(next); localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); };
-  const activateFile = React.useCallback((file, handle = null, append = false, autoplay = false) => {
+  const activateFile = React.useCallback((file, handle = null, append = false, autoplay = false, restoring = false) => {
     if (!file || !file.type.startsWith('video/') && !/\.(mp4|m4v|webm|ogv|ogg|mov|mkv|avi|mpg|mpeg|3gp|ts)$/i.test(file.name)) { notify('Choose a video file to open.'); return; }
     const id = stableId(file);
+    localStorage.setItem(ACTIVE_VIDEO_KEY, id);
     const prior = readHistory().find((item) => item.id === id);
-    const item = { id, name: file.name, size: file.size, lastModified: file.lastModified, lastOpened: Date.now(), lastPlayed: prior?.lastPlayed || 0, position: prior?.position || 0, duration: prior?.duration || 0, saved: prior?.saved || false, handleKey: handle ? id : prior?.handleKey || '' };
-    if (handle) saveHandle(id, handle); else saveLocalFile(id, file);
+    const item = { id, name: file.name, size: file.size, lastModified: file.lastModified, lastOpened: restoring ? (prior?.lastOpened || Date.now()) : Date.now(), lastPlayed: prior?.lastPlayed || 0, position: prior?.position || 0, duration: prior?.duration || 0, saved: prior?.saved || false, handleKey: handle ? id : prior?.handleKey || '' };
+    if (handle) saveHandle(id, handle);
+    // Keep a local IndexedDB copy as a fallback when the browser asks for the
+    // file handle again after a restart. This never leaves the device.
+    saveLocalFile(id, file);
     const nextHistory = [item, ...readHistory().filter((entry) => entry.id !== id)];
     writeHistory(nextHistory); setHistory(nextHistory);
     const entry = { id, name: file.name, file, handleKey: item.handleKey };
@@ -266,6 +263,7 @@ function App() {
 
   const activateDesktopVideo = (video, append = false, autoplay = false) => {
     const id = `desktop:${video.path}`;
+    localStorage.setItem(ACTIVE_VIDEO_KEY, id);
     const prior = readHistory().find((item) => item.id === id);
     const { src: mediaSrc, ...metadata } = video;
     const item = { ...metadata, id, saved: prior?.saved || false, position: prior?.position || 0, duration: prior?.duration || 0, lastPlayed: prior?.lastPlayed || 0, handleKey: '' };
@@ -278,6 +276,53 @@ function App() {
     setActiveIndex(index); setSrc(mediaSrc); setTitle(video.name); setResumeAt(settings.resume ? item.position : 0); setOpenPanel('');
     if (autoplay) setPlayRequest((request) => request + 1);
   };
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const restoreLastVideo = async () => {
+      const desktop = Boolean(window.afterframeDesktop?.isDesktop);
+      let items = readHistory();
+      if (desktop) {
+        try {
+          const desktopItems = await window.afterframeDesktop.getLibrary();
+          if (cancelled) return;
+          const storedByPath = new Map(items.filter((item) => item.path).map((item) => [item.path, item]));
+          const restored = desktopItems.map((item) => ({ ...item, id: `desktop:${item.path}`, ...(storedByPath.get(item.path) || {}), path: item.path }));
+          items = [...restored, ...items.filter((item) => !item.path)];
+          writeHistory(items);
+          setHistory(items);
+        } catch { /* Keep the local library available when desktop storage is offline. */ }
+      }
+      const rememberedId = localStorage.getItem(ACTIVE_VIDEO_KEY);
+      if (rememberedId === '') return;
+      const mostRecentResumable = [...items].filter((item) => Number(item.position) > 0).sort((a, b) => Number(b.lastPlayed || b.lastOpened || 0) - Number(a.lastPlayed || a.lastOpened || 0))[0];
+      const item = items.find((entry) => entry.id === rememberedId) || (rememberedId === null ? mostRecentResumable : null);
+      if (!item || cancelled) return;
+      if (desktop && item.path) {
+        try {
+          const video = await window.afterframeDesktop.restoreVideo(item.path);
+          if (!cancelled) activateDesktopVideo(video, false, true);
+        } catch { /* Keep the item in the library; the user can reopen it manually. */ }
+        return;
+      }
+      let handle = item.handleKey ? await findHandle(item.handleKey) : null;
+      if (handle) {
+        try {
+          if (await handle.queryPermission({ mode: 'read' }) !== 'granted') handle = null;
+        } catch { handle = null; }
+      }
+      let file = null;
+      if (handle) {
+        try { file = await handle.getFile(); } catch { handle = null; }
+      }
+      if (!file) file = await findLocalFile(item.id);
+      if (!cancelled && file) activateFile(file, handle, false, true, true);
+    };
+    restoreLastVideo();
+    return () => { cancelled = true; };
+  // Restore once on launch; the callback closes over the initial resume preference (enabled by default).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const openPicker = async () => {
     if (window.afterframeDesktop?.isDesktop) {
@@ -348,12 +393,28 @@ function App() {
     } else files.forEach((file, index) => activateFile(file, null, index > 0));
     event.target.value = '';
   };
-  const removeHistoryItem = (id) => { const removed = history.find((item) => item.id === id); const next = history.filter((item) => item.id !== id); setHistory(next); writeHistory(next); if (removed?.path && window.afterframeDesktop?.isDesktop) window.afterframeDesktop.forgetVideo(removed.path).catch(() => {}); if (!removed?.path) forgetLocalFile(id); };
+  const removeHistoryItem = async (id) => {
+    const removed = history.find((item) => item.id === id);
+    const next = history.filter((item) => item.id !== id);
+    setHistory(next); writeHistory(next);
+    if (localStorage.getItem(ACTIVE_VIDEO_KEY) === id) {
+      localStorage.setItem(ACTIVE_VIDEO_KEY, '');
+      setSrc(''); setTitle(''); setResumeAt(0); setPlaylist([]); playlistRef.current = []; setActiveIndex(-1);
+      if (objectUrlRef.current) { URL.revokeObjectURL(objectUrlRef.current); objectUrlRef.current = ''; }
+    }
+    if (removed?.path && window.afterframeDesktop?.isDesktop) window.afterframeDesktop.forgetVideo(removed.path).catch(() => {});
+    if (!removed?.path) forgetLocalFile(id);
+    if (supabase && cloudUser && removed?.name && (removed.size || removed.lastModified)) {
+      const videoKey = await cloudVideoKey(removed);
+      await supabase.from('video_progress').delete().eq('user_id', cloudUser.id).eq('video_key', videoKey);
+    }
+  };
   const toggleSaved = (id) => { const next = history.map((item) => item.id === id ? { ...item, saved: !item.saved } : item); setHistory(next); writeHistory(next); };
   const activatePlaylistIndex = (index, autoplay = false) => {
     const entry = playlistRef.current[index];
     if (!entry) return;
     const historyItem = readHistory().find((item) => item.id === entry.id);
+    localStorage.setItem(ACTIVE_VIDEO_KEY, entry.id);
     if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
     const url = entry.file ? URL.createObjectURL(entry.file) : entry.src;
     if (entry.file) objectUrlRef.current = url;
@@ -367,12 +428,17 @@ function App() {
     const next = readHistory().map((item) => item.id === entryId ? { ...item, position, duration: duration || item.duration, lastPlayed: Date.now() } : item);
     writeHistory(next); setHistory(next);
   }, []);
+  const handlePlaybackEnded = React.useCallback((entryId) => {
+    if (localStorage.getItem(ACTIVE_VIDEO_KEY) === entryId) localStorage.setItem(ACTIVE_VIDEO_KEY, '');
+    setSrc(''); setTitle(''); setResumeAt(0); setPlaylist([]); playlistRef.current = []; setActiveIndex(-1);
+    if (objectUrlRef.current) { URL.revokeObjectURL(objectUrlRef.current); objectUrlRef.current = ''; }
+  }, []);
 
   return <main className="app-window" onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={onDrop}>
     <VideoPlayer>
       <Container className="player-stage">
         <Video src={src || undefined} playsInline preload="metadata" aria-label={title || 'AFTERFRAME video player'}>{externalSubtitle && <track key={`${externalSubtitle.src}-${externalSubtitleLanguage}`} kind="subtitles" src={externalSubtitle.src} srcLang={externalSubtitleLanguage} label={`${externalSubtitle.label} · ${SUBTITLE_LANGUAGES.find((language) => language.code === externalSubtitleLanguage)?.name || externalSubtitleLanguage}`} />}</Video>
-        <AppChrome title={title} src={src} hasVideo={Boolean(src)} playRequest={playRequest} onOpen={openPicker} onPanel={setOpenPanel} openPanel={openPanel} history={history} onOpenLibraryItem={openLibraryItem} onRemoveHistory={removeHistoryItem} onToggleSaved={toggleSaved} settings={settings} onSettings={persistSettings} onClose={() => setOpenPanel('')} onProgress={handleProgress} activeId={playlist[activeIndex]?.id} onPrevious={() => activatePlaylistIndex(activeIndex - 1)} onNext={() => activatePlaylistIndex(activeIndex + 1)} playlist={playlist} activeIndex={activeIndex} resumeAt={resumeAt} onResumeApplied={() => setResumeAt(0)} notify={notify} externalSubtitle={externalSubtitle} externalSubtitleLanguage={externalSubtitleLanguage} onSubtitleLanguageChange={setExternalSubtitleLanguage} onLoadSubtitle={() => subtitleInputRef.current?.click()} cloudUser={cloudUser} cloudStatus={cloudStatus} cloudBusy={cloudBusy} onCloudAuth={submitCloudAuth} onCloudSignOut={signOutCloud} onCloudSync={() => syncCloudHistory(readHistory(), true)} />
+        <AppChrome title={title} src={src} hasVideo={Boolean(src)} playRequest={playRequest} onOpen={openPicker} onPanel={setOpenPanel} openPanel={openPanel} history={history} onOpenLibraryItem={openLibraryItem} onRemoveHistory={removeHistoryItem} onToggleSaved={toggleSaved} settings={settings} onSettings={persistSettings} onClose={() => setOpenPanel('')} onProgress={handleProgress} onPlaybackEnded={handlePlaybackEnded} activeId={playlist[activeIndex]?.id} onPrevious={() => activatePlaylistIndex(activeIndex - 1)} onNext={() => activatePlaylistIndex(activeIndex + 1)} playlist={playlist} activeIndex={activeIndex} resumeAt={resumeAt} onResumeApplied={() => setResumeAt(0)} notify={notify} externalSubtitle={externalSubtitle} externalSubtitleLanguage={externalSubtitleLanguage} onSubtitleLanguageChange={setExternalSubtitleLanguage} onLoadSubtitle={() => subtitleInputRef.current?.click()} cloudUser={cloudUser} cloudStatus={cloudStatus} cloudBusy={cloudBusy} onCloudAuth={submitCloudAuth} onCloudSignOut={signOutCloud} onCloudSync={() => syncCloudHistory(readHistory(), true)} />
       </Container>
     </VideoPlayer>
     <input ref={inputRef} className="file-input" type="file" accept={`video/*,${FORMATS}`} multiple onChange={onReopenFiles} aria-label="Choose video files" />
@@ -416,6 +482,7 @@ function AppChrome(props) {
   const timerRef = React.useRef(null);
   const feedbackTimerRef = React.useRef(null);
   const appliedResumeRef = React.useRef('');
+  const handledEndedRef = React.useRef('');
   const appliedPlayRequestRef = React.useRef(0);
   const lastSaveRef = React.useRef(0);
   const playbackSnapshotRef = React.useRef(null);
@@ -423,6 +490,17 @@ function AppChrome(props) {
   const rates = playbackRates?.length ? playbackRates : [0.5, 0.75, 1, 1.25, 1.5, 2];
   const active = props.playlist[props.activeIndex];
   playbackSnapshotRef.current = active?.id && props.hasVideo && currentSrc === props.src ? { id: active.id, position: ended ? 0 : currentTime, duration } : null;
+
+  React.useEffect(() => {
+    if (!ended || !active?.id || !props.hasVideo || currentSrc !== props.src) {
+      if (!ended) handledEndedRef.current = '';
+      return;
+    }
+    const endedKey = `${active.id}:${props.src}`;
+    if (handledEndedRef.current === endedKey) return;
+    handledEndedRef.current = endedKey;
+    props.onPlaybackEnded(active.id);
+  }, [ended, active?.id, props.hasVideo, currentSrc, props.src, props.onPlaybackEnded]);
 
   const reveal = React.useCallback(() => {
     setControlsVisible(true); clearTimeout(timerRef.current);
