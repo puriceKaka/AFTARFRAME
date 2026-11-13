@@ -16,6 +16,12 @@ create index if not exists video_progress_user_updated_idx
 
 alter table public.video_progress enable row level security;
 
+-- Make the script safe to run again from the Supabase SQL Editor.
+drop policy if exists "Users can read their own video progress" on public.video_progress;
+drop policy if exists "Users can insert their own video progress" on public.video_progress;
+drop policy if exists "Users can update their own video progress" on public.video_progress;
+drop policy if exists "Users can delete their own video progress" on public.video_progress;
+
 create policy "Users can read their own video progress"
   on public.video_progress for select to authenticated
   using ((select auth.uid()) = user_id);
